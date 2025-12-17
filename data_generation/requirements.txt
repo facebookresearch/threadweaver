@@ -1,0 +1,35 @@
+# Core dependencies
+numpy==1.26.4
+pandas==2.2.3
+
+# Machine learning and transformers
+transformers==4.51.1
+datasets==3.6.0
+torch==2.6.0
+
+# API clients
+openai==1.75.0
+
+# Math and symbolic computation
+sympy==1.13.1
+pylatexenc==2.10
+
+# Visualization
+matplotlib==3.10.3
+
+# Progress bars and CLI
+tqdm==4.67.1
+termcolor==3.1.0
+
+# HTTP requests
+requests==2.32.3
+
+# SGLang for server utilities
+sglang==0.4.6.post1
+
+# Tokenizers (required by transformers)
+tokenizers==0.21.1
+
+# Additional dependencies that may be needed
+safetensors==0.5.3
+huggingface-hub==0.31.4
