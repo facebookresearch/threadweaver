@@ -25,7 +25,7 @@ termcolor==3.1.0
 requests==2.32.3
 
 # SGLang for server utilities
-sglang==0.4.6.post1
+sglang==0.5.3.post1
 
 # Tokenizers (required by transformers)
 tokenizers==0.21.1
