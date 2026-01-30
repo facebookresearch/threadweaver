@@ -1,12 +1,7 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-# 
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from typing import List, Union
@@ -14,8 +9,9 @@ from typing import List, Union
 import numpy as np
 import pandas as pd
 from openai import OpenAI
-from rewards import rllm_reward_fn_math, grade_answer_verl
-
+from rewards import rllm_reward_fn_math
+from rewards import grade_answer_verl
+from rewards import get_special_token_ids, get_parallel_stats
 from termcolor import colored
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -86,8 +82,8 @@ parser.add_argument(
 parser.add_argument(
     "--data-type",
     type=str,
-    default="aime",
-    help="Type of dataset to evaluate. Default is 'aime'.",
+    default="./data/mult-10k-par_pq/train.parquet",
+    help="Type of dataset to evaluate. Default is './data/mult-10k-par_pq/train.parquet'.",
 )
 parser.add_argument(
     "-n",
@@ -140,10 +136,21 @@ parser.add_argument(
     help="Wait time in seconds before performing the health check after launching the server. Default is 0 seconds.",
 )
 parser.add_argument(
-    "--n-workers",
+    "--branching-generate",
+    action="store_true",
+    help="If set, use branching generation instead of standard generation. This is useful for models that support structured generation.",
+)
+parser.add_argument(
+    "--data-parallel-workers",
     type=int,
-    default=128,
-    help="Number of worker threads to use for processing samples. Default is 128.",
+    default=32,
+    help="Worker threads for parallelizing prompts. Default is 32.",
+)
+parser.add_argument(
+    "--reasoning-parallel-workers",
+    type=int,
+    default=4,
+    help="Worker threads for parallelizing branches in branching generation. Default is 4.",
 )
 parser.add_argument(
     "--total-splits",
@@ -177,11 +184,6 @@ parser.add_argument(
     "--skip-system-prompt-check",
     action="store_true",
     help="If set, skip the check for the system prompt in the chat template. This is useful if you are sure the system prompt is correct or if you are using a model that does not have a system prompt.",
-)
-parser.add_argument(
-    "--no-conclusion",
-    action="store_true",
-    help="Set this for model trained to not generate conclusion.",
 )
 args = parser.parse_args()
 
@@ -238,17 +240,6 @@ model_path = model_name
 max_context_length = args.max_context_length
 
 if args.launch_server:
-    if args.autoregressive:
-        assert (
-            os.environ["CONDA_DEFAULT_ENV"] == "verl"
-        ), "Please run this script in the verl conda environment."
-    else:
-        assert (
-            os.environ["CONDA_DEFAULT_ENV"] == "multiverse"
-        ), "Please run this script in the multiverse conda environment."
-        if args.n_workers > 32:
-            args.n_workers = 32
-            print("Limiting number of workers to 32 for multiverse model.")
     num_gpus = (
         len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
         if "CUDA_VISIBLE_DEVICES" in os.environ
@@ -289,7 +280,6 @@ if args.launch_server:
     if args.bfloat16:
         other_args.extend(["--dtype", "bfloat16"])
 
-    print(f"Launching model server for {model_name} with TP={tp_size}, DP={dp_size} on port {openai_api_port}...")
     process = popen_launch_server(
         model=model_path,
         base_url=openai_api_base.removesuffix("/v1"),
@@ -338,6 +328,9 @@ thread_end_id = tokenizer.convert_tokens_to_ids(thread_end)
 outlines_end_id = tokenizer.convert_tokens_to_ids(outlines_end)
 eos_id = tokenizer.eos_token_id
 
+# Get special token IDs for parallel stats computation
+special_token_ids = get_special_token_ids(tokenizer)
+
 # Display the first few rows to check the data
 print(f"Loaded {data_type} dataset with {len(df)} rows")
 
@@ -354,7 +347,7 @@ def check_model_availability(model):
         print(
             f"WARNING: Model '{model}' was not found in available models! Available models are: {available_models}"
         )
-        print("Please verify the model name or ensure the model is loaded.")
+        print(f"Please verify the model name or ensure the model is loaded.")
         return False
 
 
@@ -367,15 +360,16 @@ if not args.skip_model_check:
         )
 
 import concurrent.futures
+import json
 import threading
-
 from concurrent.futures import ThreadPoolExecutor
 
 generated_text = []
 messages_list = messages_all
 
 n_samples = args.n_samples
-n_workers = args.n_workers
+data_parallel_workers = args.data_parallel_workers
+reasoning_parallel_workers = args.reasoning_parallel_workers
 print(f"Number of samples to generate for each prompt: {n_samples}")
 
 # Total operations to be performed
@@ -442,17 +436,299 @@ def generate_single_sample(prompt_token_ids, messages, stop_tokens_ids):
         return completion.choices[0].message.content
 
 
+# This is for structured generation (that parses the output).
+def generate_until_any(
+    model_name, tokenizer, prompt, stop, max_new_tokens, temperature, top_p
+):
+    prompt_token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    max_tokens = min(max_new_tokens, max_context_length - len(prompt_token_ids) - 1)
+
+    if max_tokens < 0:
+        raise ValueError(
+            f"max_new_tokens ({max_new_tokens}) is too small for the prompt length ({len(prompt_token_ids)}) and max context length ({max_context_length})."
+        )
+
+    completion = client.completions.create(
+        model=model_name,
+        prompt=prompt_token_ids,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        stop=stop,
+        extra_body={"add_special_tokens": False, "skip_special_tokens": False},
+    )
+
+    gen_text = completion.choices[0].text
+
+    finish_reason = completion.choices[0].finish_reason
+    if finish_reason == "length":
+        hit = None
+    elif finish_reason == "stop":
+        hit = completion.choices[0].matched_stop
+        if hit != eos_id:
+            # If it's eos token, we don't append it (and it's an id rather than a string)
+            gen_text += hit  # append the stop token to the generated text
+    else:
+        raise ValueError(f"Unexpected finish reason: {finish_reason}")
+    full_text = prompt + gen_text
+    return gen_text, full_text, hit
+
+def branching_generate(
+    model_name,
+    tokenizer,
+    base_prompt: str,
+    sampling_params: dict,
+    newlines_between_path: bool = False,
+    verbose: bool = False,
+):
+    """
+    Assumes base_prompt already contains a <Parallel>…<Outlines>…</Outlines> block.
+    1) Generate up to </Outlines>
+    2) Extract all <Outline> numbers
+    3) For each, generate its <Thread>…</Thread>
+    4) Merge all threads
+    """
+
+    def _generate_branch(outlines_full: str, num: str):
+        branch_prompt = outlines_full + f"\n<Thread>\n{num}:"
+        if verbose:
+            print(colored(f"Generating branch for outline: {num}", "blue"))
+            print(colored(f"Branch prompt:\n{branch_prompt}\n" + "-" * 20, "blue"))
+        branch_gen, _, _ = generate_until_any(
+            model_name,
+            tokenizer,
+            prompt=branch_prompt,
+            stop=[thread_end],
+            temperature=sampling_params["temperature"],
+            top_p=sampling_params["top_p"],
+            max_new_tokens=sampling_params["max_new_tokens"],
+        )
+        return branch_gen
+
+    max_workers = max(1, reasoning_parallel_workers)
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+
+    # This loop structure suggests a potential iterative process,
+    # where the output of one round can be the input for the next.
+    try:
+        while True:
+            # Step 1: generate through </Outlines>
+            if verbose:
+                print(colored("--- Step 1: Generating up to </Outlines> ---", "blue"))
+                print(f"Input prompt:\n{base_prompt}\n" + "=" * 20)
+
+            try:
+                outlines_text, outlines_full, hit = generate_until_any(
+                    model_name,
+                    tokenizer,
+                    prompt=base_prompt,
+                    stop=[outlines_end],
+                    # do_sample=sampling_params["temperature"] > 0,
+                    temperature=sampling_params["temperature"],
+                    top_p=sampling_params["top_p"],
+                    max_new_tokens=sampling_params["max_new_tokens"],
+                )
+            except ValueError as e:
+                # Likely during overlong generation
+                print(colored(f"Error during generation: {e}", "red"))
+                return base_prompt
+
+            if verbose:
+                print(
+                    f"{colored('Generation result (full text):', 'green')}\n{outlines_full}\n"
+                    + "=" * 20
+                )
+
+            if hit is None:
+                if verbose:
+                    print(
+                        colored(
+                            "--- No </Outlines> found, returning the full output. ---",
+                            "yellow",
+                        )
+                    )
+                # no </Outlines> found, just return the full output
+                return outlines_full
+
+            # Step 2: pull out outline numbers
+            if verbose:
+                print(colored("--- Step 2: Extracting outline numbers ---", "blue"))
+
+            # Find the last occurrence of <Outlines> and extract only outlines after that
+            outlines_start_index = outlines_text.rfind("<Outlines>")
+            if outlines_start_index == -1:
+                # No <Outlines> tag found, search in the entire text
+                outline_nums = re.findall(
+                    r"<Outline>\s*([0-9]+(?:\.[0-9]+)*)\s*:", outlines_text
+                )
+            else:
+                # Search only in the text after the last <Outlines> tag
+                outline_nums = re.findall(
+                    r"<Outline>\s*([0-9]+(?:\.[0-9]+)*)\s*:",
+                    outlines_text[outlines_start_index:],
+                )
+
+            if verbose:
+                print(
+                    colored(
+                        f"Found outline numbers: {outline_nums}\n" + "=" * 20, "green"
+                    )
+                )
+
+            if not outline_nums:
+                if verbose:
+                    print(
+                        colored(
+                            "--- No outline numbers found. Nothing to branch. Returning... ---",
+                            "yellow",
+                        )
+                    )
+                # no outlines → nothing to branch
+                return outlines_full
+
+            # Step 3: generate each <Thread> once
+            if verbose:
+                print(
+                    colored(
+                        "--- Step 3: Generating each <Thread> in parallel ---", "blue"
+                    )
+                )
+            branches_gen = {}
+
+            try:
+                futures = {
+                    executor.submit(_generate_branch, outlines_full, num): num
+                    for num in outline_nums
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    num = futures[future]
+                    branch_gen = future.result()
+                    branches_gen[num] = branch_gen
+                    if verbose:
+                        print(
+                            colored(
+                                f"Generated branch for {num}:\n{branch_gen}\n"
+                                + "-" * 20,
+                                "green",
+                            )
+                        )
+            except Exception as e:
+                for future in futures:
+                    future.cancel()
+                # Likely during overlong generation
+                print(colored(f"Error during branch generation: {e}", "red"))
+                return outlines_full
+
+            # Step 4: stitch together
+            if verbose:
+                print(
+                    colored(
+                        f"--- Step 4: Merging branches ({branches_gen.keys()}, {len(branches_gen)} in total) ---",
+                        "blue",
+                    )
+                )
+            merged = outlines_full
+            end_seq = False
+            for i, num in enumerate(outline_nums):
+                branch_gen = branches_gen[num]
+                # We extract just the generated part for the final composition
+                # thread_content = branch_full.split(f"\n<Thread>\n{num}:", 1)[-1]
+                thread_content = branch_gen
+                if not thread_content.endswith(thread_end):
+                    print(
+                        f"WARNING: Thread content does not end with {thread_end}: {thread_content=}"
+                    )
+                    end_seq = True
+                    thread_content += "</Thread>"
+                # assert thread_content.endswith(thread_end), f"Thread content does not end with {thread_end}: {thread_content}"
+                assert not thread_content.endswith(
+                    "\n"
+                ), f"Thread content should not end with a newline. {thread_content=}"
+                if newlines_between_path:
+                    merged += f"\n<Thread>\n{num}:{thread_content}"
+                else:
+                    # NOTE: there was an inconsistency in the legacy version: there should be a "\n" before the first <Thread>
+                    if i == 0:
+                        merged += "\n"
+                    merged += f"<Thread>\n{num}:{thread_content}"
+
+            if end_seq:
+                print(
+                    "WARNING: Some thread did not end properly, returning the merged text without continuing."
+                )
+                return merged
+
+            merged += "\n"
+
+            if verbose:
+                print(
+                    colored(
+                        f"Final merged text:\n{merged}\n" + "=" * 20,
+                        "green",
+                    )
+                )
+                print(
+                    colored(
+                        "--- Loop will now continue with the merged text as the new base_prompt ---",
+                        "blue",
+                    )
+                )
+
+            # The loop continues, using the merged text as the new base_prompt.
+            # To complete the generation as described in the docstring, you would
+            # need a final generation step here and then a `return` or `break`.
+            # As the original code stands, it re-enters the loop.
+            base_prompt = merged
+    finally:
+        executor.shutdown(wait=True)
+
+
+
+
+def generate_single_sample_branching(prompt_token_ids, base_prompt, stop_tokens_ids):
+    assert (
+        text_completion
+    ), "Branching generation is only supported for text completion mode."
+    assert (
+        not stop_tokens_ids
+    ), "Stop tokens are not supported for branching generation."
+
+    # base_prompt = apply_chat_template(messages)
+    gen_text = branching_generate(
+        model_name,
+        tokenizer,
+        base_prompt=base_prompt,
+        sampling_params={
+            "max_new_tokens": max_context_length - len(prompt_token_ids) - 1,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+        },
+        verbose=args.verbose > 2,
+    )
+
+    return gen_text
+
+
 def process_sample(message_idx, sample_idx, jsonl_file_path, lock):
     """Process a single sample for a given message."""
     messages = messages_list[message_idx]
     prompt = apply_chat_template(messages)
     prompt_token_ids = tokenizer.encode(prompt, add_special_tokens=False)
 
-    stop_tokens_ids = [outlines_end_id, thread_end_id]
-    if not args.no_stop_at_eos:
-        stop_tokens_ids.append(eos_id)
+    if args.branching_generate:
+        stop_tokens_ids = []  # Branching generation does not use stop tokens
+    else:
+        stop_tokens_ids = [outlines_end_id, thread_end_id]
+        if not args.no_stop_at_eos:
+            stop_tokens_ids.append(eos_id)
 
-    result = generate_single_sample(prompt_token_ids, messages, stop_tokens_ids)
+    if args.branching_generate:
+        # Use branching generation if specified
+        result = generate_single_sample_branching(
+            prompt_token_ids, base_prompt=prompt, stop_tokens_ids=stop_tokens_ids
+        )
+    else:
+        result = generate_single_sample(prompt_token_ids, messages, stop_tokens_ids)
 
     # Write to JSONL file with lock
     jsonl_entry = {
@@ -484,7 +760,7 @@ if args.suffix:
 split_suffix = f"_split{args.current_split}_of_{args.total_splits}" if args.total_splits > 1 else ""
 
 if not args.debug:
-    results_dir = f"data/{save_base_path}"
+    results_dir = f"{save_base_path}"
     jsonl_file = f"{results_dir}/{data_type}_{n_samples}{split_suffix}.jsonl"
     final_json_file = f"{results_dir}/{data_type}_{n_samples}{split_suffix}.json"
     print(f"Results will be saved to: {jsonl_file}")
@@ -536,7 +812,7 @@ print(
 
 # Use ThreadPoolExecutor to process remaining messages in parallel
 if remaining_tasks:
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+    with ThreadPoolExecutor(max_workers=data_parallel_workers) as executor:
         futures = {
             executor.submit(process_sample, msg_idx, sample_idx, jsonl_file, jsonl_lock): (
                 msg_idx,
@@ -586,8 +862,6 @@ print(f"All samples completed successfully. Final results saved to {final_json_f
 
 progress_bar.close()
 
-# %% end of change
-
 prompts = df["prompt"]
 responses = generated_text
 data_sources = df["data_source"]
@@ -616,7 +890,6 @@ def rllm_reward_fn(
             ground_truth = json.loads(ground_truth)
         except json.JSONDecodeError:
             return False
-        # return rllm_reward_fn_code(data_source, llm_solution, ground_truth, **kwargs)
         raise NotImplementedError(
             f"Reward function for {data_source} is not implemented yet."
         )
@@ -625,68 +898,114 @@ def rllm_reward_fn(
             data_source, llm_solution, ground_truth, extra_info, **kwargs
         )
 
+use_full_reward_fn = True
+passes = 0
+total = len(df)
+total_scores = []
+total_parallel = []
+# New metric accumulators
+total_acceleration_ratios = []
+total_parallel_ratios = []
+total_num_tokens_list = []
+total_num_tokens_in_longest_thread_list = []
 
-for use_full_reward_fn in [True, False]:
-    passes = 0
-    total = len(df)
-    total_scores = []
-    total_parallel = []
+for i in range(total):
+    response_lst = responses[i]
+    data_source = data_sources[i]
+    prompt = prompts[i]
+    reward_data = reward_model_data[i]
+    reward_fn = rllm_reward_fn
+    ground_truth = reward_data["ground_truth"]
+    score_lst = []
+    parallel_lst = []
+    # Metrics for this sample
+    acceleration_ratios = []
+    parallel_ratios = []
+    num_tokens_list = []
+    num_tokens_in_longest_thread_list = []
 
-    for i in range(total):
-        response_lst = responses[i]
-        data_source = data_sources[i]
-        prompt = prompts[i]
-        reward_data = reward_model_data[i]
-        # reward_fn = select_reward_fn(data_source)
-        reward_fn = rllm_reward_fn
-        ground_truth = reward_data["ground_truth"]
-        score_lst = []
-        parallel_lst = []
-        for r in response_lst:
-            is_parallel = "<Parallel>" in r
-            parallel_lst.append(is_parallel)
-            # Multiverse uses <Think> and </Think> tags, so we need to replace them with <think> and </think> for compatibility
-            r = r.replace("<Think>", "<think>").replace("</Think>", "</think>")
-            if use_full_reward_fn:
-                score = reward_fn(data_source, r, ground_truth, strip_comma_from_answer=args.strip_comma_from_answer)
-            else:
-                if args.strip_comma_from_answer:
-                    r = r.replace(",", "")
-                score = grade_answer_verl(r, ground_truth)
-            score_lst.append(score)
-        max_score = np.max(score_lst)
-        total_scores.append(score_lst)
-        total_parallel.append(parallel_lst)
-        if max_score == 1:
-            passes += 1
+    for r in response_lst:
+        is_parallel = "<Parallel>" in r
+        parallel_lst.append(is_parallel)
+        # Multiverse uses <Think> and </Think> tags, so we need to replace them with <think> and </think>
+        r = r.replace("<Think>", "<think>").replace("</Think>", "</think>")
+        if use_full_reward_fn:
+            score = reward_fn(data_source, r, ground_truth, strip_comma_from_answer=args.strip_comma_from_answer)
+        else:
+            if args.strip_comma_from_answer:
+                r = r.replace(",", "")
+            score = grade_answer_verl(r, ground_truth)
+        score_lst.append(score)
 
-    pass_at_n = passes / total
-    pass_at_1 = np.mean(total_scores)
+        # Compute parallel stats for each response
+        response_token_ids = tokenizer.encode(r, add_special_tokens=False)
+        parallel_stats = get_parallel_stats(response_token_ids, special_token_ids)
+        acceleration_ratios.append(parallel_stats["acceleration_ratio"])
+        parallel_ratios.append(parallel_stats["parallel_ratio"])
+        num_tokens_list.append(parallel_stats["total_num_tokens"])
+        num_tokens_in_longest_thread_list.append(parallel_stats["num_tokens_in_the_longest_thread"])
 
-    row_data = {
-        "pass@1": pass_at_1,
-        f"pass@{n_samples}": pass_at_n,
-    }
+    max_score = np.max(score_lst)
+    total_scores.append(score_lst)
+    total_parallel.append(parallel_lst)
+    total_acceleration_ratios.append(acceleration_ratios)
+    total_parallel_ratios.append(parallel_ratios)
+    total_num_tokens_list.append(num_tokens_list)
+    total_num_tokens_in_longest_thread_list.append(num_tokens_in_longest_thread_list)
+    if max_score == 1:
+        passes += 1
 
-    print(
-        "With strict grading function:"
-        if use_full_reward_fn
-        else "With loose grading function:"
-    )
-    print(f"Pass@1: {pass_at_1} ({pass_at_1 * 100:.2f})")
-    if n_samples > 1:
-        print(f"Pass@{n_samples}: {pass_at_n} ({pass_at_n * 100:.2f})")
+pass_at_n = passes / total
+pass_at_1 = np.mean(total_scores)
 
-    # Only show this with loose grading function
-    if not use_full_reward_fn:
-        total_scores = [
-            [1.0 if val else 0.0 for val in score_list] for score_list in total_scores
-        ]
+row_data = {
+    "pass@1": pass_at_1,
+    f"pass@{n_samples}": pass_at_n,
+}
 
-        sampling_accs = []
+print(
+    "With strict grading function:"
+    if use_full_reward_fn
+    else "With loose grading function:"
+)
+print(f"Pass@1: {pass_at_1} ({pass_at_1 * 100:.2f})")
+print(f"Pass@{n_samples}: {pass_at_n} ({pass_at_n * 100:.2f})")
 
-        for idx in range(n_samples):
-            sampling_acc = np.mean([item[idx] for item in total_scores])
-            sampling_accs.append(sampling_acc)
+total_scores = [
+    [1.0 if val else 0.0 for val in score_list] for score_list in total_scores
+]
 
-        print(f"Sampling accuracies: {[f'{acc:.2f}' for acc in sampling_accs]}")
+# print("Scores:", total_scores)
+# True for including <Parallel> tags, False for not including
+# print("Parallel responses:", total_parallel)
+
+sampling_accs = []
+
+for idx in range(n_samples):
+    sampling_acc = np.mean([item[idx] for item in total_scores])
+    sampling_accs.append(sampling_acc)
+
+print(f"Sampling accuracies: {[f'{acc:.2f}' for acc in sampling_accs]}")
+
+# Compute and display average metrics
+print("\n" + "="*50)
+print("Parallel Execution Metrics:")
+print("="*50)
+
+# Flatten all metrics
+all_acceleration_ratios = [ratio for sample_ratios in total_acceleration_ratios for ratio in sample_ratios]
+all_parallel_ratios = [ratio for sample_ratios in total_parallel_ratios for ratio in sample_ratios]
+all_num_tokens = [tokens for sample_tokens in total_num_tokens_list for tokens in sample_tokens]
+all_num_tokens_longest = [tokens for sample_tokens in total_num_tokens_in_longest_thread_list for tokens in sample_tokens]
+
+# Compute averages
+avg_acceleration_ratio = np.mean(all_acceleration_ratios) if all_acceleration_ratios else 0.0
+avg_parallel_ratio = np.mean(all_parallel_ratios) if all_parallel_ratios else 0.0
+avg_total_num_tokens = np.mean(all_num_tokens) if all_num_tokens else 0.0
+avg_num_tokens_longest = np.mean(all_num_tokens_longest) if all_num_tokens_longest else 0.0
+
+print(f"Average acceleration_ratio: {avg_acceleration_ratio:.4f}")
+print(f"Average parallel_ratio: {avg_parallel_ratio:.4f}")
+print(f"Average total_num_tokens: {avg_total_num_tokens:.2f}")
+print(f"Average num_tokens_in_the_longest_thread: {avg_num_tokens_longest:.2f}")
+print("="*50 + "\n")
