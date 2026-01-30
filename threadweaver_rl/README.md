@@ -1,6 +1,6 @@
 # ThreadWeaver RL
 
-ThreadWeaver has a reinforcement learning component for training large language models to generate parallel reasoning paths when solving complex mathematical problems. Built on top of [VERL (Volcano Engine Reinforcement Learning)](https://github.com/volcengine/verl), ThreadWeaver enables models to explore multiple solution strategies simultaneously, improving both solution quality and computational efficiency.
+ThreadWeaver has a reinforcement learning component for training large language models to generate parallel reasoning paths when solving complex mathematical problems. Built on top of [VERL (Volcano Engine Reinforcement Learning)](https://github.com/volcengine/verl) ([source commit](https://github.com/verl-project/verl/tree/0d4541f397828843525b3f3a7eadff03d56ff24c)), ThreadWeaver enables models to explore multiple solution strategies simultaneously, improving both solution quality and computational efficiency.
 
 ## Overview
 
